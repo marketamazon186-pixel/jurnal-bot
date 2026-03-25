@@ -66,55 +66,47 @@ def cari_user(chat_id: str):
     return None
 
 def daftarkan_user(chat_id: str, nama: str):
-    """
-    Duplikasi template spreadsheet untuk user baru.
-    Return (spreadsheet_id, link) atau raise Exception.
-    """
-    client = get_client()
+    import requests as req
+    import google.auth.transport.requests
 
-    # 1. Copy template spreadsheet
-    drive = client.auth.authorize(client.session)  # reuse session
+    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+    creds.refresh(google.auth.transport.requests.Request())
+    token = creds.token
+
     copy_title = f"Jurnal Keuangan - {nama}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
 
-    # Gunakan Drive API untuk copy file
-    import requests
-    token = client.auth.token
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    body = {"name": copy_title}
-    resp = requests.post(
+    resp = req.post(
         f"https://www.googleapis.com/drive/v3/files/{TEMPLATE_ID}/copy",
         headers=headers,
-        json=body
+        json={"name": copy_title}
     )
     if resp.status_code != 200:
-        raise Exception(f"Gagal copy template: {resp.text}")
+        raise Exception(f"Gagal copy: {resp.text}")
 
     new_id = resp.json()["id"]
     link = f"https://docs.google.com/spreadsheets/d/{new_id}/edit"
 
-    # 2. Share ke anyone with link (view)
-    perm_body = {"role": "writer", "type": "anyone"}
-    requests.post(
+    req.post(
         f"https://www.googleapis.com/drive/v3/files/{new_id}/permissions",
         headers=headers,
-        json=perm_body
+        json={"role": "writer", "type": "anyone"}
     )
 
-    # 3. Update chat_id user di sheet ⚙️ Setting spreadsheet baru
     try:
+        client = get_client()
         new_ss = client.open_by_key(new_id)
         setting_sheet = new_ss.worksheet("⚙️ Setting")
-        # Cari baris Chat ID (baris 5, kolom B)
         setting_sheet.update("B5", str(chat_id))
     except Exception as e:
-        logger.warning(f"Tidak bisa update setting sheet: {e}")
+        logger.warning(f"Tidak bisa update setting: {e}")
 
-    # 4. Simpan ke master sheet
     sheet = get_master_sheet()
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     sheet.append_row([chat_id, nama, new_id, link, now, "aktif"])
-
-    # 5. Cache
     _user_cache[chat_id] = {
         "chat_id": chat_id,
         "nama": nama,
@@ -125,7 +117,6 @@ def daftarkan_user(chat_id: str, nama: str):
     }
 
     return new_id, link
-
 # ── USER SHEET: sheet Transaksi milik user ────────────────────────────────────
 def get_user_sheet(chat_id: str):
     """Dapatkan sheet Transaksi milik user. Raise jika belum daftar."""
