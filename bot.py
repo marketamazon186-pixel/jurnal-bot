@@ -1,143 +1,94 @@
-import logging
 import os
 import re
-import requests as req
+import logging
 from datetime import datetime
+from psycopg2 import pool
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import gspread
 from google.oauth2.service_account import Credentials
-import google.auth.transport.requests
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+# ── CONFIG & ENV ──────────────────────────────────────────────────────────────
 BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
-TEMPLATE_ID      = os.environ.get("SPREADSHEET_ID", "")
-MASTER_ID        = os.environ.get("MASTER_SPREADSHEET_ID", "")
+DB_URL           = os.environ.get("DATABASE_URL", "")
 CREDENTIALS_FILE = "credentials.json"
+SERVICE_EMAIL    = "jurnal-bot-2@fresh-gravity-488918-f1.iam.gserviceaccount.com"
+TEMPLATE_LINK    = "https://docs.google.com/spreadsheets/d/GANTI_DENGAN_ID_TEMPLATE_ANDA/edit"
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_user_cache = {}
+# ── DATABASE CONNECTION POOL ──────────────────────────────────────────────────
+try:
+    db_pool = pool.SimpleConnectionPool(1, 20, DB_URL)
+    if not db_pool:
+        raise ValueError("Pool gagal diinisialisasi.")
+except Exception as e:
+    logger.critical(f"DB Connection Error: {e}")
+    raise SystemExit(1)
 
-# ── GOOGLE AUTH ───────────────────────────────────────────────────────────────
-def get_client():
-    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
-    return gspread.authorize(creds)
-
-def get_token():
-    """Ambil access token dari service account."""
-    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
-    creds.refresh(google.auth.transport.requests.Request())
-    return creds.token
-
-# ── MASTER SHEET ──────────────────────────────────────────────────────────────
-def get_master_sheet():
-    client = get_client()
-    spreadsheet = client.open_by_key(MASTER_ID)
+def execute_query(query: str, params: tuple = None, fetchone: bool = False, fetchall: bool = False):
+    conn = db_pool.getconn()
     try:
-        sheet = spreadsheet.worksheet("Users")
-    except gspread.WorksheetNotFound:
-        sheet = spreadsheet.add_worksheet(title="Users", rows=1000, cols=6)
-        sheet.append_row(["chat_id", "nama", "spreadsheet_id", "link", "tanggal_daftar", "status"])
-    return sheet
-
-def cari_user(chat_id: str):
-    if chat_id in _user_cache:
-        return _user_cache[chat_id]
-    try:
-        sheet = get_master_sheet()
-        records = sheet.get_all_records()
-        for row in records:
-            if str(row.get("chat_id", "")) == str(chat_id):
-                _user_cache[chat_id] = row
-                return row
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            if fetchone:
+                result = cur.fetchone()
+                conn.commit()
+                return result
+            if fetchall:
+                result = cur.fetchall()
+                conn.commit()
+                return result
+            conn.commit()
     except Exception as e:
-        logger.error(f"Error cari_user: {e}")
+        conn.rollback()
+        logger.error(f"SQL Execution Error: {e}")
+        raise
+    finally:
+        db_pool.putconn(conn)
+
+def get_user(chat_id: str):
+    query = "SELECT spreadsheet_id, spreadsheet_link FROM users WHERE chat_id = %s AND status = 'aktif';"
+    row = execute_query(query, (chat_id,), fetchone=True)
+    if row:
+        return {"spreadsheet_id": row[0], "link": row[1]}
     return None
 
-def daftarkan_user(chat_id: str, nama: str):
-    """Duplikasi template spreadsheet untuk user baru."""
-    token = get_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
+def upsert_user(chat_id: str, nama: str, spreadsheet_id: str, link: str):
+    query = """
+        INSERT INTO users (chat_id, nama, spreadsheet_id, spreadsheet_link)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (chat_id) DO UPDATE 
+        SET spreadsheet_id = EXCLUDED.spreadsheet_id, 
+            spreadsheet_link = EXCLUDED.spreadsheet_link,
+            status = 'aktif';
+    """
+    execute_query(query, (chat_id, nama, spreadsheet_id, link))
 
-    # 1. Copy template ke Drive milik Service Account (bukan Drive pribadi)
-    copy_title = f"Jurnal Keuangan - {nama}"
-    resp = req.post(
-        f"https://www.googleapis.com/drive/v3/files/{TEMPLATE_ID}/copy",
-        headers=headers,
-        params={"supportsAllDrives": "true"},
-        json={
-            "name": copy_title,
-            "parents": ["root"]  # Simpan ke root Drive Service Account
-        }
-    )
-    if resp.status_code != 200:
-        raise Exception(f"Gagal copy template: {resp.text}")
+# ── GOOGLE SHEETS INTEGRATION ─────────────────────────────────────────────────
+def get_gspread_client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    return gspread.authorize(creds)
 
-    new_id = resp.json()["id"]
-    link = f"https://docs.google.com/spreadsheets/d/{new_id}/edit"
-
-    # 2. Share ke anyone (writer) agar user bisa akses
-    req.post(
-        f"https://www.googleapis.com/drive/v3/files/{new_id}/permissions",
-        headers=headers,
-        params={"supportsAllDrives": "true"},
-        json={"role": "writer", "type": "anyone"}
-    )
-
-    # 3. Update Chat ID di sheet Setting
+def verify_and_init_sheet(spreadsheet_id: str) -> bool:
     try:
-        client = get_client()
-        new_ss = client.open_by_key(new_id)
-        setting_sheet = new_ss.worksheet("⚙️ Setting")
-        setting_sheet.update("B5", str(chat_id))
+        client = get_gspread_client()
+        ss = client.open_by_key(spreadsheet_id)
+        try:
+            ss.worksheet("Transaksi")
+        except gspread.WorksheetNotFound:
+            sheet = ss.add_worksheet(title="Transaksi", rows=1000, cols=10)
+            sheet.append_row(["Tanggal", "Waktu", "Tipe", "Kategori", "Jumlah", "Catatan"])
+        return True
     except Exception as e:
-        logger.warning(f"Tidak bisa update setting sheet: {e}")
+        logger.error(f"Gspread Verification Error: {e}")
+        return False
 
-    # 4. Simpan ke master
-    sheet = get_master_sheet()
-    now = datetime.now().strftime("%d/%m/%Y %H:%M")
-    sheet.append_row([chat_id, nama, new_id, link, now, "aktif"])
-
-    # 5. Cache
-    _user_cache[chat_id] = {
-        "chat_id": chat_id,
-        "nama": nama,
-        "spreadsheet_id": new_id,
-        "link": link,
-        "tanggal_daftar": now,
-        "status": "aktif"
-    }
-
-    return new_id, link
-
-# ── USER SHEET ────────────────────────────────────────────────────────────────
-def get_user_sheet(chat_id: str):
-    user = cari_user(str(chat_id))
-    if not user:
-        raise ValueError("BELUM_DAFTAR")
-    client = get_client()
-    spreadsheet = client.open_by_key(user["spreadsheet_id"])
-    try:
-        sheet = spreadsheet.worksheet("Transaksi")
-    except gspread.WorksheetNotFound:
-        sheet = spreadsheet.add_worksheet(title="Transaksi", rows=1000, cols=10)
-        sheet.append_row(["Tanggal", "Waktu", "Tipe", "Kategori", "Jumlah", "Catatan"])
-    return sheet
-
-def add_transaction(chat_id: str, tipe, kategori, jumlah, catatan=""):
-    sheet = get_user_sheet(chat_id)
+def add_transaction(spreadsheet_id: str, tipe: str, kategori: str, jumlah: int, catatan: str):
+    client = get_gspread_client()
+    sheet = client.open_by_key(spreadsheet_id).worksheet("Transaksi")
     now = datetime.now()
     sheet.append_row([
         now.strftime("%d/%m/%Y"),
@@ -148,238 +99,149 @@ def add_transaction(chat_id: str, tipe, kategori, jumlah, catatan=""):
         catatan
     ])
 
-def get_summary(chat_id: str, period="hari"):
-    sheet = get_user_sheet(chat_id)
+def get_summary(spreadsheet_id: str, period: str = "hari") -> str:
+    client = get_gspread_client()
+    sheet = client.open_by_key(spreadsheet_id).worksheet("Transaksi")
     records = sheet.get_all_records()
     now = datetime.now()
-    pemasukan = 0
-    pengeluaran = 0
-    detail_masuk = []
-    detail_keluar = []
+    pemasukan, pengeluaran = 0, 0
+    detail_masuk, detail_keluar = [], []
 
     for row in records:
         try:
             tgl = datetime.strptime(row.get("Tanggal", ""), "%d/%m/%Y")
-        except:
+        except ValueError:
             continue
+            
         if period == "hari" and tgl.date() != now.date():
             continue
-        elif period == "bulan" and (tgl.month != now.month or tgl.year != now.year):
+        if period == "bulan" and (tgl.month != now.month or tgl.year != now.year):
             continue
 
-        jumlah = int(str(row.get("Jumlah", 0)).replace(".", "").replace(",", ""))
-        tipe = str(row.get("Tipe", "")).upper()
-        kategori = row.get("Kategori", "-")
-        catatan = row.get("Catatan", "")
+        try:
+            jumlah = int(str(row.get("Jumlah", 0)).replace(".", "").replace(",", ""))
+        except ValueError:
+            continue
 
+        tipe = str(row.get("Tipe", "")).upper()
+        kategori = str(row.get("Kategori", "-"))
+        catatan = str(row.get("Catatan", ""))
+
+        format_item = f"  • {kategori}: Rp {jumlah:,}".replace(",", ".") + (f" ({catatan})" if catatan else "")
         if tipe == "MASUK":
             pemasukan += jumlah
-            detail_masuk.append(f"  + {kategori}: Rp {jumlah:,}".replace(",", ".") + (f" ({catatan})" if catatan else ""))
+            detail_masuk.append(format_item)
         elif tipe == "KELUAR":
             pengeluaran += jumlah
-            detail_keluar.append(f"  - {kategori}: Rp {jumlah:,}".replace(",", ".") + (f" ({catatan})" if catatan else ""))
+            detail_keluar.append(format_item)
 
     saldo = pemasukan - pengeluaran
-    periode_label = "Hari Ini" if period == "hari" else f"Bulan {now.strftime('%B %Y')}"
-    text = f"📊 *Laporan {periode_label}*\n\n"
-
-    if detail_masuk:
-        text += "💚 *Pemasukan:*\n" + "\n".join(detail_masuk) + "\n"
-        text += f"*Total Masuk: Rp {pemasukan:,}*\n\n".replace(",", ".")
-    else:
-        text += "💚 *Pemasukan:* Belum ada\n\n"
-
-    if detail_keluar:
-        text += "🔴 *Pengeluaran:*\n" + "\n".join(detail_keluar) + "\n"
-        text += f"*Total Keluar: Rp {pengeluaran:,}*\n\n".replace(",", ".")
-    else:
-        text += "🔴 *Pengeluaran:* Belum ada\n\n"
-
-    emoji_saldo = "✅" if saldo >= 0 else "⚠️"
-    text += f"{emoji_saldo} *Saldo: Rp {saldo:,}*".replace(",", ".")
+    label = "Hari Ini" if period == "hari" else f"Bulan {now.strftime('%B %Y')}"
+    
+    text = f"📊 *Laporan {label}*\n\n"
+    text += "💚 *Pemasukan:*\n" + ("\n".join(detail_masuk) if detail_masuk else "Belum ada") + f"\n*Total: Rp {pemasukan:,}*\n\n".replace(",", ".")
+    text += "🔴 *Pengeluaran:*\n" + ("\n".join(detail_keluar) if detail_keluar else "Belum ada") + f"\n*Total: Rp {pengeluaran:,}*\n\n".replace(",", ".")
+    text += f"{'✅' if saldo >= 0 else '⚠️'} *Saldo: Rp {saldo:,}*".replace(",", ".")
     return text
 
-# ── PARSE TRANSAKSI ───────────────────────────────────────────────────────────
-def parse_transaksi(text):
-    text = text.strip().lower()
-    pattern = r'^(masuk|\+|keluar|-)\s+([\d.,]+)\s*(.*)$'
-    match = re.match(pattern, text)
+# ── LOGIC PARSER ──────────────────────────────────────────────────────────────
+def parse_transaksi(text: str):
+    match = re.match(r'^(masuk|\+|keluar|-)\s+([\d.,]+)\s*(.*)$', text.strip().lower())
     if not match:
         return None
-    tipe_raw, jumlah_raw, sisanya = match.groups()
+    tipe_raw, jumlah_raw, sisa = match.groups()
     tipe = "MASUK" if tipe_raw in ("masuk", "+") else "KELUAR"
-    jumlah = int(jumlah_raw.replace(".", "").replace(",", ""))
-    parts = sisanya.strip().split(" ", 1)
+    jumlah = int(re.sub(r'[.,]', '', jumlah_raw))
+    parts = sisa.strip().split(" ", 1)
     kategori = parts[0].capitalize() if parts[0] else "Lainnya"
     catatan = parts[1] if len(parts) > 1 else ""
     return tipe, kategori, jumlah, catatan
 
-# ── HANDLERS ──────────────────────────────────────────────────────────────────
+# ── TELEGRAM HANDLERS ─────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    user = cari_user(chat_id)
+    user = get_user(chat_id)
+    
     keyboard = [
         ["📥 Catat Masuk", "📤 Catat Keluar"],
         ["📊 Laporan Hari Ini", "📅 Laporan Bulan Ini"],
         ["❓ Bantuan"]
     ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
     if user:
-        await update.message.reply_text(
-            f"👋 Halo kembali!\n\n"
-            f"📊 Spreadsheet kamu:\n{user['link']}\n\n"
-            f"Ketik *Bantuan* untuk panduan.",
-            parse_mode="Markdown",
-            reply_markup=reply_markup
-        )
+        await update.message.reply_text(f"✅ Sistem aktif. Terhubung ke:\n{user['link']}", reply_markup=markup)
     else:
-        await update.message.reply_text(
-            "👋 Halo! Selamat datang di *Jurnal Keuangan Bot*! 💰\n\n"
-            "Bot ini membantu kamu mencatat keuangan otomatis ke Google Spreadsheet!\n\n"
-            "Untuk mulai, ketik:\n👉 /daftar\n\n"
-            "Spreadsheet pribadi kamu akan langsung dibuat secara otomatis!",
-            parse_mode="Markdown",
-            reply_markup=reply_markup
-        )
+        await update.message.reply_text("Sistem Jurnal Aktif. Ketik /daftar untuk inisiasi.", reply_markup=markup)
 
 async def daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    instruksi = (
+        "⚙️ *Prosedur Registrasi:*\n\n"
+        f"1. Buka Template: [Klik Disini]({TEMPLATE_LINK})\n"
+        "2. Pilih menu *File* > *Make a copy*.\n"
+        f"3. Klik *Share*, ubah akses ke *Editor* untuk email berikut:\n`{SERVICE_EMAIL}`\n"
+        "4. Copy link spreadsheet kamu yang baru.\n"
+        "5. Kirim ke bot dengan format:\n`/setlink [LINK_SPREADSHEET]`"
+    )
+    await update.message.reply_text(instruksi, parse_mode="Markdown", disable_web_page_preview=True)
+
+async def setlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     nama = update.effective_user.first_name or "User"
-
-    existing = cari_user(chat_id)
-    if existing:
-        await update.message.reply_text(
-            f"✅ Kamu sudah terdaftar!\n\n"
-            f"📊 Spreadsheet kamu:\n{existing['link']}\n\n"
-            f"Mulai catat: `masuk 50000 Gaji`",
-            parse_mode="Markdown"
-        )
+    pesan = update.message.text.replace("/setlink", "").strip()
+    
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", pesan)
+    if not match:
+        await update.message.reply_text("❌ Format URL tidak valid. Ekstraksi ID gagal.")
         return
-
-    await update.message.reply_text(
-        "⏳ Sedang menyiapkan spreadsheet pribadimu...\nMohon tunggu sebentar ya! 🙏"
-    )
-
-    try:
-        spreadsheet_id, link = daftarkan_user(chat_id, nama)
-        await update.message.reply_text(
-            f"🎉 *Selamat {nama}! Pendaftaran berhasil!*\n\n"
-            f"📊 Spreadsheet pribadimu sudah siap:\n"
-            f"👉 {link}\n\n"
-            f"*Cara catat transaksi:*\n"
-            f"`masuk 500000 Gaji`\n"
-            f"`keluar 25000 Makan siang`\n\n"
-            f"Ketik *Bantuan* untuk panduan lengkap. 💪",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Error daftar: {e}")
-        await update.message.reply_text(
-            "❌ Maaf, ada gangguan saat mendaftar.\n"
-            "Silakan coba lagi dalam beberapa menit ya!"
-        )
-
-async def bantuan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *Panduan Jurnal Keuangan Bot*\n\n"
-        "*🆕 Daftar (pertama kali):*\n`/daftar`\n\n"
-        "*💰 Catat Pemasukan:*\n"
-        "`masuk 50000 Gaji`\n`+ 100000 Transfer`\n\n"
-        "*💸 Catat Pengeluaran:*\n"
-        "`keluar 25000 Makan siang`\n`- 50000 Bensin`\n\n"
-        "*📊 Laporan:*\n"
-        "Ketik `laporan hari` atau `laporan bulan`\n\n"
-        "*📋 Lihat spreadsheet:*\n`/spreadsheet`",
-        parse_mode="Markdown"
-    )
-
-async def spreadsheet_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    user = cari_user(chat_id)
-    if user:
-        await update.message.reply_text(
-            f"📊 *Spreadsheet kamu:*\n{user['link']}",
-            parse_mode="Markdown"
-        )
+        
+    spreadsheet_id = match.group(1)
+    await update.message.reply_text("⏳ Memvalidasi akses API...")
+    
+    if verify_and_init_sheet(spreadsheet_id):
+        upsert_user(chat_id, nama, spreadsheet_id, pesan)
+        await update.message.reply_text("✅ Autentikasi sukses. Sistem siap menerima transaksi.")
     else:
-        await update.message.reply_text("Kamu belum daftar! Ketik /daftar dulu. 😊")
+        await update.message.reply_text(f"❌ Akses ditolak. Pastikan email `{SERVICE_EMAIL}` telah diberikan izin *Editor*.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    text_lower = text.lower()
+    text = update.message.text.strip().lower()
     chat_id = str(update.effective_chat.id)
-
-    if text_lower in ["📊 laporan hari ini", "laporan hari"]:
-        try:
-            await update.message.reply_text(get_summary(chat_id, "hari"), parse_mode="Markdown")
-        except ValueError:
-            await update.message.reply_text("Kamu belum daftar! Ketik /daftar dulu. 😊")
+    
+    if text in ["📊 laporan hari ini", "laporan hari"]:
+        user = get_user(chat_id)
+        if not user: return await update.message.reply_text("❌ Akses ditolak. Eksekusi /daftar.")
+        await update.message.reply_text(get_summary(user["spreadsheet_id"], "hari"), parse_mode="Markdown")
         return
 
-    if text_lower in ["📅 laporan bulan ini", "laporan bulan"]:
-        try:
-            await update.message.reply_text(get_summary(chat_id, "bulan"), parse_mode="Markdown")
-        except ValueError:
-            await update.message.reply_text("Kamu belum daftar! Ketik /daftar dulu. 😊")
-        return
-
-    if text_lower in ["❓ bantuan", "bantuan", "help"]:
-        await bantuan(update, context)
-        return
-
-    if text_lower == "📥 catat masuk":
-        await update.message.reply_text(
-            "💚 Kirim pemasukan:\n`masuk [jumlah] [kategori]`\n\nContoh: `masuk 500000 Gaji`",
-            parse_mode="Markdown"
-        )
-        return
-
-    if text_lower == "📤 catat keluar":
-        await update.message.reply_text(
-            "🔴 Kirim pengeluaran:\n`keluar [jumlah] [kategori]`\n\nContoh: `keluar 25000 Makan`",
-            parse_mode="Markdown"
-        )
+    if text in ["📅 laporan bulan ini", "laporan bulan"]:
+        user = get_user(chat_id)
+        if not user: return await update.message.reply_text("❌ Akses ditolak. Eksekusi /daftar.")
+        await update.message.reply_text(get_summary(user["spreadsheet_id"], "bulan"), parse_mode="Markdown")
         return
 
     result = parse_transaksi(text)
     if result:
+        user = get_user(chat_id)
+        if not user:
+            await update.message.reply_text("❌ Akses ditolak. Eksekusi /daftar.")
+            return
+            
         tipe, kategori, jumlah, catatan = result
         try:
-            add_transaction(chat_id, tipe, kategori, jumlah, catatan)
-            emoji = "💚" if tipe == "MASUK" else "🔴"
-            label = "Pemasukan" if tipe == "MASUK" else "Pengeluaran"
-            await update.message.reply_text(
-                f"{emoji} *{label} dicatat!*\n\n"
-                f"Kategori: {kategori}\n"
-                f"Jumlah: Rp {jumlah:,}\n".replace(",", ".") +
-                (f"Catatan: {catatan}\n" if catatan else "") +
-                f"\n✅ Tersimpan di spreadsheet.",
-                parse_mode="Markdown"
-            )
-        except ValueError:
-            await update.message.reply_text(
-                "⚠️ Kamu belum daftar!\n\nKetik /daftar untuk membuat spreadsheet pribadimu. 😊"
-            )
+            add_transaction(user["spreadsheet_id"], tipe, kategori, jumlah, catatan)
+            await update.message.reply_text(f"✅ Input diotorisasi:\n[{tipe}] {kategori} - Rp {jumlah:,}".replace(",", "."))
         except Exception as e:
-            logger.error(f"Error saving: {e}")
-            await update.message.reply_text("❌ Gagal menyimpan. Coba lagi ya.")
-    else:
-        await update.message.reply_text(
-            "🤔 Format tidak dikenali.\n\n"
-            "Contoh:\n`masuk 50000 Gaji`\n`keluar 25000 Makan`\n\n"
-            "Ketik *Bantuan* untuk panduan.",
-            parse_mode="Markdown"
-        )
+            logger.error(f"Failed transaction injection: {e}")
+            await update.message.reply_text("❌ Celah I/O. Gagal menulis ke Spreadsheet.")
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("daftar", daftar))
-    app.add_handler(CommandHandler("bantuan", bantuan))
-    app.add_handler(CommandHandler("spreadsheet", spreadsheet_link))
+    app.add_handler(CommandHandler("setlink", setlink))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Bot multi-user started!")
+    logger.info("Service initialized.")
     app.run_polling()
 
 if __name__ == "__main__":
