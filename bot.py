@@ -71,12 +71,16 @@ def daftarkan_user(chat_id: str, nama: str):
         "Content-Type": "application/json"
     }
 
-    # 1. Copy template
+    # 1. Copy template ke Drive milik Service Account (bukan Drive pribadi)
     copy_title = f"Jurnal Keuangan - {nama}"
     resp = req.post(
         f"https://www.googleapis.com/drive/v3/files/{TEMPLATE_ID}/copy",
         headers=headers,
-        json={"name": copy_title}
+        params={"supportsAllDrives": "true"},
+        json={
+            "name": copy_title,
+            "parents": ["root"]  # Simpan ke root Drive Service Account
+        }
     )
     if resp.status_code != 200:
         raise Exception(f"Gagal copy template: {resp.text}")
@@ -84,10 +88,11 @@ def daftarkan_user(chat_id: str, nama: str):
     new_id = resp.json()["id"]
     link = f"https://docs.google.com/spreadsheets/d/{new_id}/edit"
 
-    # 2. Share ke anyone (writer)
+    # 2. Share ke anyone (writer) agar user bisa akses
     req.post(
         f"https://www.googleapis.com/drive/v3/files/{new_id}/permissions",
         headers=headers,
+        params={"supportsAllDrives": "true"},
         json={"role": "writer", "type": "anyone"}
     )
 
